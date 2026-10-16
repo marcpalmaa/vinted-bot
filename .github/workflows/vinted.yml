@@ -1,6 +1,4 @@
-"""
-Versión para GitHub Actions del bot de Vinted (API nueva: svc-catalogue).
- 
+"""Versión para GitHub Actions del bot de Vinted (API nueva: svc-catalogue).
 En cada ejecución (que lanza GitHub cada ~5 min) el script:
   1. lee los comandos que le hayas mandado al bot (/add, /list, /remove),
   2. revisa tus filtros cada CHECK_EVERY_SECONDS durante RUN_SECONDS,
