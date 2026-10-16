@@ -5,6 +5,10 @@ on:
     - cron: "*/5 * * * *"
   workflow_dispatch:
 
+permissions:
+  contents: read
+  actions: write
+
 concurrency:
   group: vinted-bot
   cancel-in-progress: false
@@ -38,4 +42,11 @@ jobs:
         if: always()
         with:
           path: state.json
-          key: state-${{ github.run_id }}
+          key: state-${{ github.run_id }}-${{ github.run_attempt }}
+
+      # Lanza la siguiente ejecución sin depender del reloj (cron) de GitHub
+      - name: Relanzar
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run vinted.yml --repo ${{ github.repository }}
