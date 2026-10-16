@@ -1,303 +1,52 @@
-"""Versión para GitHub Actions del bot de Vinted (API nueva: svc-catalogue).
-En cada ejecución (que lanza GitHub cada ~5 min) el script:
-  1. lee los comandos que le hayas mandado al bot (/add, /list, /remove),
-  2. revisa tus filtros cada CHECK_EVERY_SECONDS durante RUN_SECONDS,
-  3. guarda el estado en state.json (el workflow lo conserva entre ejecuciones).
-"""
-import json
-import logging
-import os
-import time
-from pathlib import Path
-from urllib.parse import urlparse, parse_qsl
- 
-from curl_cffi import requests as cffi_requests
- 
-TOKEN = os.environ["TELEGRAM_TOKEN"]
-API = f"https://api.telegram.org/bot{TOKEN}"
-RUN_SECONDS = int(os.getenv("RUN_SECONDS", "270"))
-CHECK_EVERY = int(os.getenv("CHECK_EVERY_SECONDS", "60"))
-FEE_FIXED = float(os.getenv("FEE_FIXED", "0.70"))
-FEE_PERCENT = float(os.getenv("FEE_PERCENT", "5"))
-SHIPPING_FROM = float(os.getenv("SHIPPING_FROM", "2.50"))
-STATE_FILE = Path(os.getenv("STATE_FILE", "state.json"))
-MAX_SEEN = 500
- 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("vinted-once")
- 
-PARAM_MAP = {
-    "catalog": "attribute_ids[catalog]",
-    "catalog_ids": "attribute_ids[catalog]",
-    "brand_ids": "attribute_ids[brand]",
-    "size_ids": "attribute_ids[size]",
-    "status_ids": "attribute_ids[status]",
-    "color_ids": "attribute_ids[color]",
-    "material_ids": "attribute_ids[material]",
-    "search_text": "search_text",
-    "price_from": "price_from",
-    "price_to": "price_to",
-    "currency": "currency",
-}
- 
-HELP = (
-    "Pega /add seguido de la URL de Vinted con tus filtros.\n\n"
-    "/add <url> — añadir filtro\n"
-    "/list — ver filtros\n"
-    "/remove <n> — borrar filtro\n\n"
-    "Los comandos se responden en un máximo de ~1 minuto."
-)
- 
-sessions: dict = {}
- 
- 
-# ---------------- Estado ----------------
-def load_state() -> dict:
-    if STATE_FILE.exists():
-        try:
-            return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            log.warning("state.json corrupto, empiezo de cero")
-    return {"offset": 0, "chats": {}}
- 
- 
-def save_state(state: dict) -> None:
-    STATE_FILE.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
- 
- 
-# ---------------- Telegram ----------------
-def tg(method: str, **data) -> dict:
-    r = cffi_requests.post(f"{API}/{method}", json=data, timeout=40)
-    r.raise_for_status()
-    return r.json()
- 
- 
-def send(chat, text: str) -> None:
-    try:
-        tg("sendMessage", chat_id=chat, text=text, disable_web_page_preview=True)
-    except Exception as e:
-        log.warning("No se pudo enviar mensaje: %s", e)
- 
- 
-# ---------------- Vinted ----------------
-def url_to_api(url: str):
-    p = urlparse(url)
-    if "vinted." not in p.netloc:
-        raise ValueError("Eso no parece una URL de Vinted.")
-    params: dict = {}
-    for key, value in parse_qsl(p.query):
-        key = key.replace("[]", "")
-        if key in PARAM_MAP and value != "":
-            params.setdefault(PARAM_MAP[key], []).append(value)
-    api_params = {k: ",".join(v) for k, v in params.items()}
-    api_params["order"] = "newest_first"
-    api_params["per_page"] = "30"
-    return p.netloc, api_params
- 
- 
-def api_host(domain: str) -> str:
-    if domain.startswith("www."):
-        return "api." + domain[4:]
-    return "api." + domain
- 
- 
-def get_session(domain: str):
-    entry = sessions.get(domain)
-    if entry is None:
-        s = cffi_requests.Session(impersonate="chrome")
-        r = s.get(f"https://{domain}/", timeout=20)
-        token = s.cookies.get("access_token_web")
-        anon = s.cookies.get("anon_id") or r.headers.get("X-Anon-Id")
-        headers = {
-            "Accept": "application/json, text/plain, */*",
-            "Origin": f"https://{domain}",
-            "Referer": f"https://{domain}/",
-        }
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
-        if anon:
-            headers["x-anon-id"] = anon
-        entry = (s, headers)
-        sessions[domain] = entry
-    return entry
- 
- 
-def fetch_items(domain: str, params: dict) -> list:
-    for _ in range(2):
-        s, headers = get_session(domain)
-        r = s.get(
-            f"https://{api_host(domain)}/svc-catalogue/items",
-            params=params, headers=headers, timeout=20,
-        )
-        if r.status_code in (401, 403):
-            sessions.pop(domain, None)
-            continue
-        r.raise_for_status()
-        return r.json().get("items", [])
-    raise RuntimeError("Vinted ha bloqueado la petición (401/403).")
- 
- 
-def to_float(v) -> float:
-    if isinstance(v, dict):
-        v = v.get("amount")
-    return float(v)
- 
- 
-def item_size(item: dict) -> str:
-    second = (item.get("item_box") or {}).get("second_line") or ""
-    if second:
-        return second.split("·")[0].strip() or "—"
-    return item.get("size_title") or "—"
- 
- 
-def item_brand(item: dict) -> str:
-    return (item.get("item_box") or {}).get("first_line") or item.get("brand_title") or ""
- 
- 
-def item_url(item: dict, domain: str) -> str:
-    url = item.get("url") or ""
-    if url.startswith("/"):
-        url = f"https://{domain}{url}"
-    return url
- 
- 
-def item_photo(item: dict) -> str:
-    photo = item.get("photo") or {}
-    return photo.get("full_size_url") or photo.get("url") or ""
- 
- 
-def format_item(item: dict, domain: str) -> str:
-    price = to_float(item["price"])
-    try:
-        with_fee = to_float(item["total_item_price"])
-    except (KeyError, TypeError, ValueError):
-        with_fee = price + FEE_FIXED + price * FEE_PERCENT / 100
-    with_ship = with_fee + SHIPPING_FROM
-    return "\n".join([
-        f"🆕 {item.get('title', '')}",
-        f"🏷️ {item_brand(item)}  |  📏 Talla: {item_size(item)}",
-        f"💶 Precio: {price:.2f} €",
-        f"🛡️ Con tasa: {with_fee:.2f} €",
-        f"📦 Con tasa + envío (desde {SHIPPING_FROM:.2f} €): {with_ship:.2f} €",
-        f"🔗 {item_url(item, domain)}",
-    ])
- 
- 
-def notify(chat, item: dict, domain: str) -> None:
-    """Envía el aviso con foto; si la foto falla, lo manda como texto con vista previa."""
-    text = format_item(item, domain)
-    photo = item_photo(item)
-    if photo:
-        try:
-            tg("sendPhoto", chat_id=chat, photo=photo, caption=text)
-            return
-        except Exception as e:
-            log.warning("No se pudo enviar la foto (%s), envío solo texto", e)
-    try:
-        tg("sendMessage", chat_id=chat, text=text)
-    except Exception as e:
-        log.warning("No se pudo enviar mensaje: %s", e)
- 
- 
-# ---------------- Comandos ----------------
-def handle_command(state: dict, chat: str, text: str) -> None:
-    parts = text.strip().split()
-    if not parts:
-        return
-    cmd = parts[0].split("@")[0].lower()
-    args = parts[1:]
-    filters = state["chats"].setdefault(chat, [])
- 
-    if cmd in ("/start", "/help"):
-        send(chat, "Hola 👋\n" + HELP)
-    elif cmd == "/add":
-        if not args:
-            send(chat, "Uso: /add <url de Vinted>")
-            return
-        try:
-            domain, params = url_to_api(args[0])
-            items = fetch_items(domain, params)
-        except Exception as e:
-            send(chat, f"No he podido usar esa URL: {e}")
-            return
-        filters.append({
-            "url": args[0],
-            "seen": [i["id"] for i in items][:MAX_SEEN],
-            # Los ids de Vinted solo suben con el tiempo: solo avisamos de ids mayores
-            "max_id": max((i["id"] for i in items), default=0),
-        })
-        if items:
-            first = items[0]
-            sample = (
-                f"Ahora mismo hay {len(items)} artículos con ese filtro. "
-                f"El más reciente: {first.get('title', '')} · talla {item_size(first)} · "
-                f"{to_float(first['price']):.2f} €."
-            )
-        else:
-            sample = "Ahora mismo no hay ningún artículo con ese filtro."
-        send(chat, f"✅ Filtro #{len(filters)} añadido.\n{sample}\nTe aviso de lo nuevo.")
-    elif cmd == "/list":
-        if not filters:
-            send(chat, "No tienes filtros. Usa /add <url>.")
-        else:
-            send(chat, "\n\n".join(f"#{n}: {f['url']}" for n, f in enumerate(filters, 1)))
-    elif cmd == "/remove":
-        try:
-            removed = filters.pop(int(args[0]) - 1)
-        except (IndexError, ValueError):
-            send(chat, "Uso: /remove <número> (mira /list).")
-            return
-        send(chat, f"🗑️ Borrado: {removed['url']}")
- 
- 
-def process_updates(state: dict) -> None:
-    try:
-        res = tg("getUpdates", offset=state["offset"], timeout=0, allowed_updates=["message"])
-    except Exception as e:
-        log.warning("getUpdates falló: %s", e)
-        return
-    for upd in res.get("result", []):
-        state["offset"] = upd["update_id"] + 1
-        msg = upd.get("message") or {}
-        text = msg.get("text")
-        if text and text.startswith("/"):
-            handle_command(state, str(msg["chat"]["id"]), text)
- 
- 
-# ---------------- Vigilancia ----------------
-def check_filters(state: dict) -> None:
-    for chat, filters in state["chats"].items():
-        for f in filters:
-            try:
-                domain, params = url_to_api(f["url"])
-                items = fetch_items(domain, params)
-            except Exception as e:
-                log.warning("Error en filtro %s: %s", f["url"], e)
-                continue
-            seen = set(f["seen"])
-            if "max_id" not in f:
-                # Filtros guardados antes de este cambio: partimos del id más alto conocido
-                f["max_id"] = max(seen) if seen else max((i["id"] for i in items), default=0)
-            new_items = [i for i in items if i["id"] > f["max_id"] and i["id"] not in seen]
-            for item in sorted(new_items, key=lambda i: i["id"]):  # del más antiguo al más nuevo
-                notify(chat, item, domain)
-                f["seen"].append(item["id"])
-                f["max_id"] = max(f["max_id"], item["id"])
-            f["seen"] = f["seen"][-MAX_SEEN:]
- 
- 
-def main() -> None:
-    state = load_state()
-    end = time.time() + RUN_SECONDS
-    while True:
-        process_updates(state)
-        check_filters(state)
-        save_state(state)
-        if time.time() + CHECK_EVERY > end:
-            break
-        time.sleep(CHECK_EVERY)
-    log.info("Ejecución terminada")
- 
- 
-if __name__ == "__main__":
-    main()
+name: vinted-bot
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: vinted-bot
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install -r requirements-actions.txt
+
+      # Recupera el estado (filtros y artículos ya vistos) de la ejecución anterior
+      - uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: state-never-matches-exactly
+          restore-keys: state-
+
+      - run: python vinted_once.py
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+
+      # Guarda el estado para la siguiente ejecución
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: state.json
+          key: state-${{ github.run_id }}-${{ github.run_attempt }}
+
+      # Lanza la siguiente ejecución sin depender del reloj (cron) de GitHub
+      - name: Relanzar
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run vinted.yml --repo ${{ github.repository }}
